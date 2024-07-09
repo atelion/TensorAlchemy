@@ -2,6 +2,7 @@ import asyncio
 import copy
 import sys
 import time
+import os
 import traceback
 from abc import ABC
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -351,6 +352,12 @@ class BaseMiner(ABC):
                     bt.Tensor.serialize(self.transform(image))
                     for image in images
                 ]
+                end_time = time.time()
+                bt.logging.info(f"Successfully generate images in {end_time-start_time} seconds with score of {top_score}")
+                if not os.path.exists("output"):
+                    os.mkdir("output")
+                decoded_image.save(f"output/{top_score}-{synapse.prompt}.png")
+
                 colored_log(
                     f"{sh('Generating')} -> Successful image generation after"
                     f" {attempt+1} attempt(s).",
@@ -369,19 +376,20 @@ class BaseMiner(ABC):
                     logger.info(
                         f"Failed to generate any images after" f" {attempt+1} attempts."
                     )
-
+        
         # Count timeouts
         if time.perf_counter() - start_time > timeout:
             self.stats.timeouts += 1
 
         # Log NSFW images
-        try:
-            if any(self.nsfw_image_filter(images)):
-                logger.info("An image was flagged as NSFW: discarding image.")
-                self.stats.nsfw_count += 1
-                synapse.images = []
-        except Exception as e:
-            logger.error(f"Error in NSFW filtering: {e}")
+        # Note: Atel: Disable NSFW part
+        # try:
+        #     if any(self.nsfw_image_filter(images)):
+        #         logger.info("An image was flagged as NSFW: discarding image.")
+        #         self.stats.nsfw_count += 1
+        #         synapse.images = []
+        # except Exception as e:
+        #     logger.error(f"Error in NSFW filtering: {e}")
 
         # Log to wandb
         try:
