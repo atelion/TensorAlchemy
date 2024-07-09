@@ -18,7 +18,7 @@ from neurons.utils import BackgroundTimer, background_loop
 from neurons.utils.defaults import Stats, get_defaults
 from neurons.utils.log import colored_log
 from neurons.utils.nsfw import clean_nsfw_from_prompt
-from utils import get_caller_stake, get_coldkey_for_hotkey
+from utils import get_caller_stake, get_coldkey_for_hotkey, base64_to_pil_image
 from utils.log import do_logs, sh
 from wandb_utils import WandbUtils
 
