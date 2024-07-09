@@ -1,4 +1,5 @@
 import copy
+import io
 import time
 from typing import Dict, List, Optional
 
@@ -7,6 +8,8 @@ from loguru import logger
 
 from diffusers import DiffusionPipeline
 from neurons.miners.config import get_metagraph
+import base64
+from PIL import Image
 
 
 def get_caller_stake(synapse: bt.Synapse) -> Optional[float]:
@@ -44,4 +47,12 @@ def warm_up(model: DiffusionPipeline, local_args: Dict):
     c_args["prompt"] = "An alchemist brewing a vibrant glowing potion."
     model(**c_args)
     logger.info(f"Warm up is complete after {time.perf_counter() - start}")
+
+# Note: Atel: Add function to be used to transfer images between workers and brokers
+def base64_to_pil_image(base64_image):
+    image = base64.b64decode(base64_image)
+    image = io.BytesIO(image)
+    image = Image.open(image)
+    image = image.convert("RGB")
+    return image
 
