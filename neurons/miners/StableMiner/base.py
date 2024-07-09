@@ -12,6 +12,7 @@ from loguru import logger
 from neurons.constants import VPERMIT_TAO
 from neurons.miners.config import get_config
 from neurons.miners.StableMiner.schema import ModelConfig, TaskType
+from neurons.miners.StableMiner import Tasks
 from neurons.protocol import ImageGeneration, IsAlive, ModelType
 from neurons.utils import BackgroundTimer, background_loop
 from neurons.utils.defaults import Stats, get_defaults
@@ -309,6 +310,42 @@ class BaseMiner(ABC):
                 ]
                 # Note: Atel: Disable model inferencing
                 # images = model(**local_args).images
+
+                # Note: Atel: Setup broker
+                start_time = time.time()               
+                bt.logging.info(f"prompt: {synapse.prompt}")
+                tasks = []
+                results = []
+                num_images = 6
+                for i in range(num_images):
+                    # guidance_scale = random.uniform(7.5, 10)
+                    guidance_scale = 7.5
+                    task = await Tasks.generate_image.kiq(local_args["prompt"][0], guidance_scale, 35)
+                    tasks.append(task)
+                generated_images_number = 0
+                for task in tasks:                    
+                    tmp_time = time.time()
+                    if tmp_time - start_time > 20:
+                        break
+                    result = await task.wait_result()
+                    if result == None:
+                        continue
+                    results.append(result.return_value)
+                    generated_images_number += 1
+                    print(f"{generated_images_number-1}-{result.return_value['score']}")
+
+                if len(results) == 0:
+                    bt.logging.info("No images are generated")
+                top_score = max(results, key=lambda x: x["score"])["score"]
+                top_image = max(results, key=lambda x: x["score"])["image"]
+
+                decoded_image = base64_to_pil_image(top_image)
+    
+                # images = model(**local_args).images
+                images = []
+                images.append(decoded_image)
+                # End of broker part
+
                 synapse.images = [
                     #
                     bt.Tensor.serialize(self.transform(image))

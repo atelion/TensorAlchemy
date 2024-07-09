@@ -44,3 +44,4 @@ def warm_up(model: DiffusionPipeline, local_args: Dict):
     c_args["prompt"] = "An alchemist brewing a vibrant glowing potion."
     model(**c_args)
     logger.info(f"Warm up is complete after {time.perf_counter() - start}")
+
