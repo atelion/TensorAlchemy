@@ -283,7 +283,8 @@ class BaseMiner(ABC):
             logger.error(f"Error setting up local args: {e}")
 
         # Get the model
-        model = model_config.model
+        # Note: Atel : Disable model loading as its not needed.
+        # model = model_config.model
 
         if synapse.generation_type.upper() == TaskType.IMAGE_TO_IMAGE:
             try:
@@ -306,7 +307,8 @@ class BaseMiner(ABC):
                         device=self.config.miner.device,
                     ).manual_seed(seed)
                 ]
-                images = model(**local_args).images
+                # Note: Atel: Disable model inferencing
+                # images = model(**local_args).images
                 synapse.images = [
                     #
                     bt.Tensor.serialize(self.transform(image))
