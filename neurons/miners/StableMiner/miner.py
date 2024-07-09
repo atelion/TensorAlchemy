@@ -46,7 +46,8 @@ class StableMiner(BaseMiner):
     def load_models(self) -> None:
         try:
             # Text-to-image
-            self.t2i_model_custom = self.load_t2i_model(self.config.miner.custom_model)
+            # Note: Xrunner: Disable model loading as its not necessary
+            # self.t2i_model_custom = self.load_t2i_model(self.config.miner.custom_model)
 
             # Image-to-image
             # self.i2i_model_custom = self.load_i2i_model(self.t2i_model_custom)
@@ -60,7 +61,8 @@ class StableMiner(BaseMiner):
             ).to(self.config.miner.device)
             self.processor = CLIPImageProcessor()
 
-            self.setup_model_configs()
+            # Note: Xrunner: Disable model config part as its not necessary
+            # self.setup_model_configs()
         except Exception as e:
             logger.error(f"Error loading models: {e}")
             raise
