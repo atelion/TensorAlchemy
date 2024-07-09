@@ -6,6 +6,9 @@ from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend
 import base64
 from diffusers import (
     DiffusionPipeline,
+    StableDiffusionXLPipeline, 
+    EulerAncestralDiscreteScheduler,
+    AutoencoderKL,
     AutoPipelineForImage2Image,
     AutoPipelineForText2Image,
     DPMSolverMultistepScheduler,
@@ -32,29 +35,23 @@ broker = ListQueueBroker(
 prompts = [
     "A serene forest with ancient trees and a carpet of bluebells.",    
 ]
-result = []
-def hash_function(input_string: str):
-    """
-    A simple hash function that converts a string input into an integer hash value.
-    
-    Args:
-        input_string (str): The input string to be hashed.
-    
-    Returns:
-        int: The hash value of the input string.
-    """
-    hash_value = 0
-    for char in input_string:
-        hash_value = (hash_value * 31 + ord(char)) % 2**32
-    return hash_value
 
-model_path_list = ["stabilityai/stable-diffusion-xl-base-1.0", "RunDiffusion/Juggernaut-XL-v9"]
-lora_path_list = ["checkpoint-5000" ,"Xrunner/dpo-juggernautxl"]
-t2i_model = DiffusionPipeline.from_pretrained(model_path_list[1], torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
-print("SDXL model loaded")
-t2i_model.load_lora_weights(lora_path_list[1], weight_name="pytorch_lora_weights.safetensors", adapter_name="imagereward-lora")
-t2i_model.set_adapters(["imagereward-lora"], adapter_weights=[0.9])
-print("Lora model loaded successfully.")
+result = []
+
+# Load VAE component
+vae = AutoencoderKL.from_pretrained(
+    "madebyollin/sdxl-vae-fp16-fix", 
+    torch_dtype=torch.float16
+)
+
+t2i_model = StableDiffusionXLPipeline.from_pretrained(
+    "dataautogpt3/ProteusV0.4-Lightning", 
+    vae=vae,
+    torch_dtype=torch.float16
+)
+
+t2i_model.scheduler = EulerAncestralDiscreteScheduler.from_config(t2i_model.scheduler.config)
+negative_prompt = "nsfw, bad quality, bad anatomy, worst quality, low quality, low resolutions, extra fingers, blur, blurry, ugly, wrongs proportions, watermark, image artifacts, lowres, ugly, jpeg artifacts, deformed, noisy image"
 scoring_model = reward.load("ImageReward-v1.0")
 
 
@@ -73,14 +70,12 @@ async def generate_image(prompt: str, guidance_scale: float, num_inference_steps
     t2i_model.to("cuda")
     
     global result
-    # t2i_model.to("cuda")
     """Solve all problems in the world."""
     
     print(f"-------------prompt in broker: {prompt}-------------------")
     print(f"-------------Guidance_scale in broker: {guidance_scale}-------------------")
-    _prompt = prompt.strip(" .") + " in cartoony anime-like style."
-    # _prompt = prompt
-    images = t2i_model(prompt=_prompt, num_inference_steps=35, guidance_scale=7.5).images
+    
+    images = t2i_model(prompt=prompt, negative_prompt=negative_prompt, width=1024, height=1024, guidance_scale=7.5, num_inference_steps=35).images
     
     
     end_time = time.time()
