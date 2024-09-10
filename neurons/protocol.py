@@ -1,33 +1,14 @@
-# The MIT License (MIT)
-# Copyright © 2023 Yuma Rao
-# Copyright © 2023 TensorAlchemy
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
-# the Software.
-
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
-# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
-
-import typing
 from enum import Enum
-from typing import Optional
-
-import pydantic
-from pydantic import BaseModel, Field
+from typing import Optional, List, Union, Any
 
 import bittensor as bt
+import numpy as np
+import torch
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 class ModelType(str, Enum):
+    SCORING = "SCORING"
     ALCHEMY = "ALCHEMY"
     CUSTOM = "CUSTOM"
 
@@ -37,7 +18,7 @@ class ImageGenerationTaskModel(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
     prompt_image: Optional[bt.Tensor] = None
-    images: Optional[typing.List[bt.Tensor]] = None
+    images: Optional[List[bt.Tensor]] = None
     num_images_per_prompt: int
     height: int
     width: int
@@ -58,37 +39,99 @@ def denormalize_image_model(
     )
 
 
+def deserialize_incoming_image(inbound_image: Any):
+    """Inbound image type is different across different miner versions."""
+    from neurons.utils.image import tensor_to_image, image_to_base64
+
+    if isinstance(inbound_image, str):
+        # Newest miners already send image as base64 string
+        return inbound_image
+
+    if isinstance(inbound_image, dict) and "buffer" in inbound_image:
+        # Older miners serializing image as bt.Tensor which is sent as dict
+        # { "buffer": "...", "dtype": "torch.uint8", "shape": [3, 1, 1] }
+        inbound = bt.Tensor(**inbound_image).deserialize()
+        return image_to_base64(tensor_to_image(tensor=inbound))
+
+    return inbound_image
+
+
 class IsAlive(bt.Synapse):
-    answer: typing.Optional[str] = None
-    completion: str = pydantic.Field(
+    computed_body_hash: str = Field("")
+    answer: Optional[str] = None
+    completion: str = Field(
         "",
         title="Completion",
-        description="Completion status of the current ImageGeneration object. This attribute is mutable and can be updated.",
+        description="Completion status of the current ImageGeneration object."
+        + " This attribute is mutable and can be updated.",
     )
+
+
+SupportedImageTypes = Union[str, np.ndarray, torch.tensor, bt.Tensor]
 
 
 class ImageGeneration(bt.Synapse):
     """
-        A simple dummy protocol representation which uses bt.Synapse as its base.
-        This protocol helps in handling dummy request and response communication between
-        the miner and the validator.
+    A simple dummy protocol representation which uses bt.Synapse
+    as its base.
 
-        Attributes:
-        - dummy_input: An integer value representing the input request sent by the validator.
-        - dummy_output: An optional integer value which, when filled, represents the response from the
-    miner.
+    This protocol helps in handling dummy request and response
+    communication between the miner and the validator.
+
+    Attributes:
+    - dummy_input: An integer value representing the input request
+                   sent by the validator.
+
+    - dummy_output: An optional integer value which, when filled,
+                    represents the response from the miner.
     """
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    computed_body_hash: str = Field("")
+
+    # Each image is base64 encoded image data
+    images: List[str] = []
+
+    prompt_image: Optional[bt.Tensor] = Field(
+        None,
+    )
     # Required request input, filled by sending dendrite caller.
-    prompt: str = pydantic.Field("Bird in the sky", allow_mutation=False)
-    negative_prompt: str = pydantic.Field(None, allow_mutation=False)
-    prompt_image: Optional[bt.Tensor]
-    images: typing.List[bt.Tensor] = []
-    num_images_per_prompt: int = pydantic.Field(1, allow_mutation=False)
-    height: int = pydantic.Field(1024, allow_mutation=False)
-    width: int = pydantic.Field(1024, allow_mutation=False)
-    generation_type: str = pydantic.Field("TEXT_TO_IMAGE", allow_mutation=False)
-    guidance_scale: float = pydantic.Field(7.5, allow_mutation=False)
-    seed: int = pydantic.Field(1024, allow_mutation=False)
-    steps: int = pydantic.Field(50, allow_mutation=False)
-    model_type: str = pydantic.Field(ModelType.ALCHEMY, allow_mutation=False)
+    prompt: str = Field(
+        "Bird in the sky",
+    )
+    negative_prompt: Optional[str] = Field(
+        None,
+    )
+    num_images_per_prompt: int = Field(
+        1,
+    )
+    height: int = Field(
+        1024,
+    )
+    width: int = Field(
+        1024,
+    )
+    generation_type: str = Field(
+        "TEXT_TO_IMAGE",
+    )
+    guidance_scale: float = Field(
+        7.5,
+    )
+    seed: int = Field(
+        -1,
+    )
+    steps: int = Field(
+        20,
+    )
+    model_type: str = Field(
+        ModelType.CUSTOM,
+    )
+
+    @field_validator("images", mode="before")
+    def images_value(cls, inbound_images_list: List[Any]) -> List[str]:
+        return [
+            #
+            deserialize_incoming_image(image)
+            for image in inbound_images_list
+        ]

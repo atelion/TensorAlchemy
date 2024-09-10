@@ -1,13 +1,13 @@
 import copy
 import io
 import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import bittensor as bt
 from loguru import logger
 
 from diffusers import DiffusionPipeline
-from neurons.miners.config import get_metagraph
+from neurons.config import get_metagraph
 import base64
 from PIL import Image
 

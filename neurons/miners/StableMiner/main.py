@@ -1,8 +1,7 @@
+import os
 import pathlib
 import sys
 import warnings
-
-from loguru import logger
 
 # Suppress the eth_utils network warnings
 # "does not have a valid ChainId."
@@ -10,23 +9,24 @@ from loguru import logger
 # TODO: Remove after updating bittensor
 warnings.simplefilter("ignore")
 
-if __name__ == "__main__":
-    try:
-        # Add the base repository to the path so the miner can access it
-        file_path: str = str(
-            pathlib.Path(__file__).parent.parent.parent.parent.resolve(),
-        )
-        if file_path not in sys.path:
-            sys.path.append(file_path)
-        # Import StableMiner after fixing path
-        from miner import StableMiner
+# Use the older torch style for now
+os.environ["USE_TORCH"] = "1"
 
-        # Start the miner
-        StableMiner()
-    except ImportError as e:
-        logger.error(f"Error importing StableMiner: {e}")
-        logger.error("Please ensure all required packages are installed.")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
-        sys.exit(1)
+
+def setup_paths():
+    file_path: str = str(
+        pathlib.Path(__file__).parent.parent.parent.parent.resolve(),
+    )
+    if file_path not in sys.path:
+        sys.path.append(file_path)
+
+
+def main():
+    setup_paths()
+    from neurons.miners.StableMiner.run_miner import run_miner
+
+    run_miner()
+
+
+if __name__ == "__main__":
+    main()

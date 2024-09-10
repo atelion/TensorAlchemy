@@ -13,7 +13,7 @@ class Stats:
 
 
 # Get default stats
-def get_defaults(self) -> Stats:
+def get_defaults() -> Stats:
     now = datetime.now()
     stats = Stats(
         start_time=now,

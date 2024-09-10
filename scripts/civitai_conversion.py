@@ -47,7 +47,9 @@ if __name__ == "__main__":
         f.write(response.content)
 
     # Get which version of diffusers is used
-    stoutdata = subprocess.getoutput("pip freeze | grep diffusers==").split("\n")
+    stoutdata = subprocess.getoutput("pip freeze | grep diffusers==").split(
+        "\n"
+    )
     version = None
     for line in stoutdata:
         if line.startswith("diffusers=="):

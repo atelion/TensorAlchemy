@@ -1,8 +1,12 @@
-import os
-
 from loguru import logger
-from openai import AsyncOpenAI
-from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_type
+from tenacity import (
+    retry,
+    wait_fixed,
+    stop_after_attempt,
+    retry_if_exception_type,
+)
+
+from neurons.config import get_openai_client
 
 
 class OpenAIRequestFailed(Exception):
@@ -10,26 +14,22 @@ class OpenAIRequestFailed(Exception):
 
 
 class OpenAIService:
-    def __init__(self):
-        openai_api_key = os.environ.get("OPENAI_API_KEY", None)
-        if not openai_api_key:
-            raise ValueError("Please set OPENAI_API_KEY")
-        self.openai_client = AsyncOpenAI(api_key=openai_api_key)
-
     @retry(
         wait=wait_fixed(1),
         stop=stop_after_attempt(5),
         retry=retry_if_exception_type(OpenAIRequestFailed),
         reraise=True,
     )
-    async def create_completion_request(self, model: str, prompt: str) -> str | None:
+    async def create_completion_request(
+        self, model: str, prompt: str
+    ) -> str | None:
         """
         Create a completion of prompt.
 
         Returns None if there is no completion
         """
         try:
-            response = await self.openai_client.chat.completions.create(
+            response = await get_openai_client().chat.completions.create(
                 model=model,
                 messages=[
                     {
@@ -44,7 +44,7 @@ class OpenAIService:
                 presence_penalty=0,
             )
         except Exception as e:
-            logger.error(f"openai completion request failed: {e}")
+            logger.error(e)
             raise OpenAIRequestFailed(str(e)) from e
 
         logger.info(f"OpenAI response object: {response}")
@@ -69,9 +69,13 @@ class OpenAIService:
         Returns True if prompt contains any nsfw content
         """
         try:
-            response = await self.openai_client.moderations.create(input=prompt)
+            response = await get_openai_client().moderations.create(
+                input=prompt
+            )
         except Exception as e:
-            logger.error(f"[check_prompt_for_nsfw] failed to do openai request: {e}")
+            logger.error(
+                f"[check_prompt_for_nsfw] failed to do openai request: {e}"
+            )
             raise OpenAIRequestFailed(str(e)) from e
 
         # Check if the moderation flagged the prompt as NSFW

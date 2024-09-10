@@ -6,55 +6,71 @@ import time
 import traceback
 import uuid
 import queue
-from multiprocessing import Manager, Queue
-from typing import Optional
+import inspect
+
+from math import ceil
+from threading import Thread
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple, Union
+from multiprocessing import Event, Manager, Queue, Process, set_start_method
+
 
 import bittensor as bt
-import sentry_sdk
 import torch
-import wandb
 import numpy as np
 from loguru import logger
 
-from neurons.constants import (
-    DEV_URL,
-    N_NEURONS,
-    PROD_URL,
-    VALIDATOR_SENTRY_DSN,
-)
+from neurons.exceptions import StakeBelowThreshold
 
+from neurons.update_checker import safely_check_for_updates
 from neurons.protocol import (
+    ModelType,
     denormalize_image_model,
     ImageGenerationTaskModel,
-    ModelType,
 )
-from neurons.utils.log import colored_log
+from neurons.utils.common import log_dependencies
 from neurons.utils.defaults import get_defaults
 from neurons.utils import (
     BackgroundTimer,
     MultiprocessBackgroundTimer,
     background_loop,
 )
+from neurons.utils.log import configure_logging
 from neurons.validator.schemas import Batch
-from neurons.validator.config import (
+from neurons.config import (
     get_device,
     get_config,
+    get_wallet,
     get_metagraph,
+    get_subtensor,
     get_backend_client,
+    validator_run_id,
 )
+from neurons.validator.utils.state import save_ma_scores, load_ma_scores
+from neurons.validator.config import update_validator_settings
 from neurons.validator.backend.client import TensorAlchemyBackendClient
 from neurons.validator.backend.models import TaskState
 from neurons.validator.forward import run_step
 from neurons.validator.services.openai.service import get_openai_service
-from neurons.validator.utils.wandb import init_wandb, reinit_wandb
 from neurons.validator.utils.version import get_validator_version
 from neurons.validator.utils import (
+    select_uids,
     ttl_get_block,
     generate_random_prompt_gpt,
-    get_device_name,
-    get_random_uids,
 )
-from neurons.validator.weights import set_weights
+from neurons.validator.weights import (
+    SetWeightsTask,
+    set_weights_loop,
+    tensor_to_list,
+)
+
+# Set the start method for multiprocessing
+set_start_method("spawn", force=True)
+
+# Define a type alias for our thread-like objects
+ThreadLike = Union[Thread, Process]
+
+upload_images_loop_suspension_end_time = None
 
 
 def is_valid_current_directory() -> bool:
@@ -78,34 +94,50 @@ async def upload_image(
     batch: Batch = batches_upload_queue.get(block=False)
     logger.info(
         #
-        f"uploading ({len(batch.computes)} compute "
+        f"uploading ({len(batch.computes)}) computes "
         + f"for batch {batch.batch_id} ..."
     )
     await backend_client.post_batch(batch)
 
 
-def upload_images_loop(batches_upload_queue: Queue) -> None:
+async def upload_images_loop(
+    _should_quit: Event,
+    batches_upload_queue: Queue,
+) -> None:
+    global upload_images_loop_suspension_end_time
+    if (
+        upload_images_loop_suspension_end_time
+        and datetime.now() < upload_images_loop_suspension_end_time
+    ):
+        logger.info(
+            f"Skipping uploads until {upload_images_loop_suspension_end_time}"
+        )
+        return
+
     # Send new batches to the Human Validation Bot
     try:
         backend_client: TensorAlchemyBackendClient = get_backend_client()
-        asyncio.run(
-            asyncio.gather(
-                *[
-                    upload_image(backend_client, batches_upload_queue)
-                    for _i in range(32)
-                ]
-            )
+        await asyncio.gather(
+            *[
+                upload_image(backend_client, batches_upload_queue)
+                for _i in range(32)
+            ]
         )
 
     except queue.Empty:
         return
-
+    except StakeBelowThreshold as e:
+        logger.error(
+            f"Exception occurred: {str(e)}. Suspending uploads for 2 hours."
+        )
+        upload_images_loop_suspension_end_time = datetime.now() + timedelta(
+            hours=2
+        )
     except Exception as e:
         logger.info(
             "An error occurred trying to submit a batch: "
             + f"{e}\n{traceback.format_exc()}"
         )
-        sentry_sdk.capture_exception(e)
 
 
 class StableValidator:
@@ -113,7 +145,9 @@ class StableValidator:
         index = None
         while True:
             try:
-                index = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+                index = self.metagraph.hotkeys.index(
+                    self.wallet.hotkey.ss58_address
+                )
             except Exception:
                 pass
 
@@ -134,58 +168,32 @@ class StableValidator:
         # Init config
         self.config = get_config()
 
-        environment: str = "production"
-        if self.config.subtensor.network == "test":
-            environment = "local"
-
-        sentry_sdk.init(
-            environment=environment,
-            dsn=VALIDATOR_SENTRY_DSN,
-        )
-
         bt.logging(
             config=self.config,
-            logging_dir=self.config.alchemy.full_path,
             debug=self.config.debug,
             trace=self.config.trace,
+            logging_dir=self.config.alchemy.full_path,
         )
+
+        configure_logging()
+        log_dependencies()
 
         # Init device.
         self.device = get_device(torch.device(self.config.alchemy.device))
-
-        self.corcel_api_key = os.environ.get("CORCEL_API_KEY")
 
         # Init external API services
         self.openai_service = get_openai_service()
 
         self.backend_client = TensorAlchemyBackendClient()
 
-        wandb.login(anonymous="must")
-
         self.prompt_generation_failures = 0
 
         # Init subtensor
-        self.subtensor = bt.subtensor(config=self.config)
+        self.subtensor = get_subtensor(config=self.config)
         logger.info(f"Loaded subtensor: {self.subtensor}")
 
-        try:
-            sentry_sdk.set_context(
-                "bittensor", {"network": str(self.subtensor.network)}
-            )
-            sentry_sdk.set_context(
-                "cuda_device", {"name": get_device_name(self.device)}
-            )
-        except Exception:
-            logger.error("Failed to set sentry context")
-
-        self.api_url = DEV_URL if self.subtensor.network == "test" else PROD_URL
-        if self.config.alchemy.force_prod:
-            self.api_url = PROD_URL
-
-        logger.info(f"Using server {self.api_url}")
-
         # Init wallet.
-        self.wallet = bt.wallet(config=self.config)
+        self.wallet = get_wallet(config=self.config)
         self.wallet.create_if_non_existent()
 
         # Dendrite pool for querying the network during training.
@@ -193,16 +201,13 @@ class StableValidator:
         logger.info(f"Loaded dendrite pool: {self.dendrite}")
 
         # Init metagraph.
-        self.metagraph = get_metagraph(
-            netuid=self.config.netuid,
-            # Make sure not to sync without passing subtensor
-            network=self.subtensor.network,
-            sync=False,
-        )
+        self.metagraph: bt.metagraph = get_metagraph(sync=False)
 
         # Sync metagraph with subtensor.
         self.metagraph.sync(subtensor=self.subtensor)
-        self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
+
+        # Keep track of latest active miners
+        self.active_uids: List[int] = []
 
         if "mock" not in self.config.wallet.name:
             # Wait until the miner is registered
@@ -211,19 +216,14 @@ class StableValidator:
         self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
         logger.info("Loaded metagraph")
 
-        # Convert metagraph.stake to a PyTorch tensor if it's a NumPy array
-        if isinstance(self.metagraph.stake, np.ndarray):
-            self.metagraph.stake = torch.from_numpy(self.metagraph.stake).float()
-
-        self.scores = torch.zeros_like(
-            self.metagraph.stake,
-            dtype=torch.float32,
-        )
-
-        # Init Weights.
-        self.moving_average_scores = torch.zeros(
-            (self.metagraph.n),
-        ).to(self.device)
+        # Convert metagraph[x] to a PyTorch tensor if it's a NumPy array
+        for key in ["stake", "uids"]:
+            if isinstance(getattr(self.metagraph, key), np.ndarray):
+                setattr(
+                    self.metagraph,
+                    key,
+                    torch.from_numpy(getattr(self.metagraph, key)).float(),
+                )
 
         # Each validator gets a unique identity (UID)
         # in the network for differentiation.
@@ -237,19 +237,20 @@ class StableValidator:
         )
 
         # Init weights
-        self.weights = torch.ones_like(self.metagraph.uids, dtype=torch.float32).to(
-            self.device
-        )
+        self.weights = torch.ones_like(
+            self.metagraph.uids, dtype=torch.float32
+        ).to(self.device)
 
         # Init prev_block and step
-        self.prev_block = ttl_get_block(self)
+        self.prev_block = ttl_get_block()
         self.step = 0
 
-        # Set validator variables
-        self.request_frequency = 35
-        self.query_timeout = 20
-        self.async_timeout = 1.2
-        self.epoch_length = 100
+        # Init sync with the network. Updates the metagraph.
+        self.resync_metagraph()
+
+        # Now load the moving average scores
+        # or initialize them from the current metagraph incentives
+        self.moving_average_scores = load_ma_scores()
 
         # Serve axon to enable external connections.
         self.serve_axon()
@@ -260,28 +261,8 @@ class StableValidator:
         # Init sync with the network. Updates the metagraph.
         asyncio.run(self.sync())
 
-        # Init wandb.
-        try:
-            init_wandb(self)
-            logger.info("Loaded wandb")
-            self.wandb_loaded = True
-        except Exception:
-            self.wandb_loaded = False
-            logger.error("Unable to load wandb. Retrying in 5 minnutes.")
-            logger.error(f"wandb loading error: {traceback.format_exc()}")
-
-        # Init blacklists and whitelists
-        self.hotkey_blacklist = set()
-        self.coldkey_blacklist = set()
-        self.hotkey_whitelist = set()
-        self.coldkey_whitelist = set()
-
-        # Init IsAlive counter
-        self.isalive_threshold = 8
-        self.isalive_dict = {i: 0 for i in range(self.metagraph.n.item())}
-
         # Init stats
-        self.stats = get_defaults(self)
+        self.stats = get_defaults()
 
         # Get vali index
         self.validator_index = self.get_validator_index()
@@ -289,139 +270,103 @@ class StableValidator:
         # Start the generic background loop
         self.storage_client = None
         self.background_steps = 1
-        self.background_timer = BackgroundTimer(
-            60,
-            background_loop,
-            [self, True],
-        )
-        self.background_timer.daemon = True
-        self.background_timer.start()
 
         # Start the batch streaming background loop
         manager = Manager()
+        self.should_quit: Event = manager.Event()
+        self.set_weights_queue: Queue = manager.Queue(maxsize=128)
         self.batches_upload_queue: Queue = manager.Queue(maxsize=2048)
-
-        self.upload_images_process = MultiprocessBackgroundTimer(
-            0.2,
-            upload_images_loop,
-            args=[self.batches_upload_queue],
-        )
-        self.upload_images_process.start()
-
-        # Create a Dict for storing miner query history
-        try:
-            self.miner_query_history_duration = {
-                self.metagraph.axons[uid].hotkey: float("inf")
-                for uid in range(self.metagraph.n.item())
-            }
-        except Exception:
-            pass
-        try:
-            self.miner_query_history_count = {
-                self.metagraph.axons[uid].hotkey: 0
-                for uid in range(self.metagraph.n.item())
-            }
-        except Exception:
-            pass
-        try:
-            self.miner_query_history_fail_count = {
-                self.metagraph.axons[uid].hotkey: 0
-                for uid in range(self.metagraph.n.item())
-            }
-        except Exception:
-            pass
 
         self.model_type = ModelType.CUSTOM
 
-    async def run(self):
-        # Main Validation Loop
-        logger.info("Starting validator loop.")
-        # Load Previous Sates
-        self.load_state()
-        self.step = 0
-        while True:
-            try:
-                logger.info("Started new validator run.")
+        self.background_loop: BackgroundTimer = None
+        self.set_weights_process: MultiprocessBackgroundTimer = None
+        self.upload_images_process: MultiprocessBackgroundTimer = None
 
-                # Get a random number of uids
-                try:
-                    uids = await get_random_uids(self, self.dendrite, k=N_NEURONS)
-                    uids = uids.to(self.device)
-                    axons = [self.metagraph.axons[uid] for uid in uids]
+        # Start all background threads
+        self.start_threads(True)
 
-                except Exception as e:
-                    logger.error("Failed to get random uids from metagraph")
-                    continue
+    def start_thread(self, thread: ThreadLike, is_startup: bool = True) -> None:
+        if thread.is_alive():
+            return
 
-                task: Optional[
-                    ImageGenerationTaskModel
-                ] = await self.get_image_generation_task()
+        thread.start()
+        if is_startup:
+            logger.info(f"Started {thread}")
+        else:
+            logger.error(f"{thread} had segfault, restarted")
 
-                if task is None:
-                    logger.warning(
-                        "image generation task was not generated successfully."
-                    )
+    def stop_processes(self) -> None:
+        processes: List[str] = [
+            "background_loop",
+            "upload_images_process",
+            "set_weights_process",
+        ]
 
-                    # Prevent loop from forming if the task
-                    # error occurs on the first step
-                    if self.step == 0:
-                        self.step += 1
+        for process_name in processes:
+            process: Process = getattr(self, process_name)
+            if process.is_alive():
+                process.terminate()
 
-                    continue
+        for process_name in processes:
+            process: Process = getattr(self, process_name)
+            process.join()
 
-                # Text to Image Run
-                await run_step(
-                    validator=self,
-                    task=task,
-                    axons=axons,
-                    uids=uids,
-                    model_type=self.model_type,
-                    stats=self.stats,
-                )
+    def update_check(self) -> None:
+        safely_check_for_updates()
 
-                try:
-                    # Re-sync with the network. Updates the metagraph.
-                    await self.sync()
-                except Exception as e:
-                    logger.error(f"Failed to sync the metagraph: {e}")
+    def start_threads(self, is_startup: bool = False) -> None:
+        logger.info(f"[start_threads] is_startup={is_startup}")
+        thread_configs: List[Tuple[str, object, float, callable, list]] = [
+            (
+                "background_loop",
+                BackgroundTimer,
+                60,
+                background_loop,
+                [self.should_quit],
+            ),
+            (
+                "upload_images_process",
+                MultiprocessBackgroundTimer,
+                0.5,
+                upload_images_loop,
+                [self.should_quit, self.batches_upload_queue],
+            ),
+            (
+                "set_weights_process",
+                MultiprocessBackgroundTimer,
+                1.0,
+                set_weights_loop,
+                [self.should_quit, self.set_weights_queue],
+            ),
+        ]
 
-                # Save Previous Sates
-                self.save_state()
+        for (
+            attr_name,
+            thread_class,
+            interval,
+            target_func,
+            args,
+        ) in thread_configs:
+            thread = getattr(self, attr_name)
+            if thread and thread.is_alive():
+                continue
 
-                # End the current step and prepare for the next iteration.
-                self.step += 1
+            new_thread = thread_class(interval, target_func, args)
 
-                # Assuming each step is 3 minutes restart wandb run ever
-                # 3 hours to avoid overloading a validators storage space
-                if self.step % 360 == 0 and self.step != 0:
-                    logger.info("Re-initializing wandb run...")
-                    try:
-                        reinit_wandb(self)
-                        self.wandb_loaded = True
-                    except Exception as e:
-                        logger.info(
-                            f"An unexpected error occurred reinitializing wandb: {e}"
-                        )
-                        self.wandb_loaded = False
+            if attr_name == "background_loop":
+                new_thread.daemon = True
 
-            # If the user interrupts the program, gracefully exit.
-            except KeyboardInterrupt:
-                logger.success("Keyboard interrupt detected. Exiting validator.")
+            setattr(self, attr_name, new_thread)
+            self.start_thread(new_thread, is_startup)
 
-                self.axon.stop()
-
-                self.upload_images_process.cancel()
-                self.upload_images_process.join()
-                sys.exit(0)
-
-            # If we encounter an unexpected error, log it for debugging.
-            except Exception as e:
-                logger.error(traceback.format_exc())
-                sentry_sdk.capture_exception(e)
+    async def reload_settings(self) -> None:
+        # Update settings from google cloud
+        await update_validator_settings()
 
     async def get_image_generation_task(
         self,
-        timeout: int = 60,
+        timeout: int = 30,
     ) -> ImageGenerationTaskModel | None:
         """
         Fetch new image generation task from backend or generate new one
@@ -440,7 +385,7 @@ class StableValidator:
         # No organic task found
         if task is None:
             self.model_type = ModelType.CUSTOM
-            prompt = await generate_random_prompt_gpt(self)
+            prompt = await generate_random_prompt_gpt()
             if not prompt:
                 logger.error("failed to generate prompt for synthetic task")
                 return None
@@ -458,7 +403,9 @@ class StableValidator:
                 height=1024,
             )
 
-        is_bad_prompt = await self.openai_service.check_prompt_for_nsfw(task.prompt)
+        is_bad_prompt = await self.openai_service.check_prompt_for_nsfw(
+            task.prompt
+        )
 
         if is_bad_prompt:
             try:
@@ -491,8 +438,23 @@ class StableValidator:
             self.resync_metagraph()
 
         if self.should_set_weights():
-            await set_weights(self)
-            self.prev_block = ttl_get_block(self)
+            try:
+                self.set_weights_queue.put_nowait(
+                    SetWeightsTask(
+                        epoch=ttl_get_block(),
+                        hotkeys=copy.deepcopy(get_metagraph().hotkeys),
+                        weights=tensor_to_list(self.moving_average_scores),
+                    )
+                )
+            except queue.Full:
+                logger.error("Cannot add weights setting task, queue is full!")
+
+            logger.info(
+                f"Added a weight setting task to the queue"
+                f" (current size={self.set_weights_queue.qsize()})"
+            )
+
+            self.prev_block = ttl_get_block()
 
     def get_validator_index(self):
         """
@@ -517,46 +479,52 @@ class StableValidator:
             "emissions": self.metagraph.emission[self.validator_index],
         }
 
-    def resync_metagraph(self):
-        """Resyncs the metagraph and updates the hotkeys
-        and moving averages based on the new metagraph."""
+    def resync_metagraph(self, **kwargs):
+        """
+        Resyncs the metagraph and updates
+        the hotkeys and moving averages based on the new metagraph.
 
-        # Copies state of metagraph before syncing.
-        previous_metagraph = copy.deepcopy(self.metagraph)
+        Args:
+            **kwargs: Additional keyword arguments to pass to metagraph.sync()
+        """
+        metagraph: bt.metagraph = get_metagraph()
+        previous_hotkeys: List[str] = metagraph.hotkeys
 
-        # Sync the metagraph.
-        self.metagraph.sync(subtensor=self.subtensor)
+        # Sync the metagraph
+        metagraph.sync(subtensor=get_subtensor(), **kwargs)
 
-        # Check if the metagraph axon info has changed.
-        if previous_metagraph.axons == self.metagraph.axons:
+        # Check if the metagraph axon info has changed
+        if previous_hotkeys == metagraph.hotkeys:
+            logger.debug(
+                #
+                "No changes in metagraph hotkeys, "
+                + "skipping resync"
+            )
             return
 
         logger.info(
-            "Metagraph updated, re-syncing hotkeys,"
-            + " dendrite pool and moving averages"
+            "Metagraph updated, re-syncing hotkeys, "
+            "dendrite pool and moving averages"
         )
 
-        # Zero out all hotkeys that have been replaced.
-        for uid, hotkey in enumerate(self.hotkeys):
-            if hotkey != self.metagraph.hotkeys[uid]:
-                self.scores[uid] = 0  # hotkey has been replaced
+        # Update the size of the moving average scores
+        new_moving_averages = torch.zeros(metagraph.n, device=get_device())
 
-        # Check to see if the metagraph has changed size.
-        # If so, we need to add new hotkeys and moving averages.
-        if len(self.hotkeys) < len(self.metagraph.hotkeys):
-            # Update the size of the moving average scores.
-            new_moving_average = torch.zeros((self.metagraph.n)).to(self.device)
-            min_len = min(len(self.hotkeys), len(self.scores))
-            new_moving_average[:min_len] = self.scores[:min_len]
-            self.scores = new_moving_average
+        # Create a mapping of old hotkeys to their scores
+        old_hotkey_scores = {
+            hotkey: score
+            for hotkey, score in zip(
+                previous_hotkeys, self.moving_average_scores
+            )
+        }
 
-            # Start following this UID
-            for uid in self.metagraph.n.item():
-                if uid not in self.isalive_dict:
-                    self.isalive_dict[uid] = 0
+        # Update moving averages and handle replaced hotkeys
+        for uid, new_hotkey in enumerate(metagraph.hotkeys):
+            if new_hotkey in old_hotkey_scores:
+                new_moving_averages[uid] = old_hotkey_scores[new_hotkey]
 
-        # Update the hotkeys.
-        self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
+        # Update instance variables
+        self.moving_average_scores = new_moving_averages
 
     def check_registered(self):
         # --- Check for registration.
@@ -577,87 +545,48 @@ class StableValidator:
         since the last checkpoint to sync.
         """
         return (
-            ttl_get_block(self) - self.metagraph.last_update[self.uid]
-        ) > self.epoch_length
+            ttl_get_block() - self.metagraph.last_update[self.uid]
+        ) > self.config.alchemy.epoch_length
 
     def should_set_weights(self) -> bool:
-        # Check if all moving_averages_socres are the 0s or 1s
+        # Check if all moving_averages_scores are 0s or 1s
         ma_scores = self.moving_average_scores
         ma_scores_sum = sum(ma_scores)
-        if any([ma_scores_sum == len(ma_scores), ma_scores_sum == 0]):
+
+        if ma_scores_sum == len(ma_scores) or ma_scores_sum == 0:
+            logger.info(
+                "All moving average scores are either 0s or 1s. "
+                + "Not setting weights."
+            )
             return False
 
-        # Check if enough epoch blocks have elapsed since the last epoch.
-        return (ttl_get_block(self) % self.prev_block) >= self.epoch_length
+        # Check if enough epoch blocks have elapsed since the last epoch
+        current_block = ttl_get_block()
+        blocks_elapsed = current_block % self.prev_block
+        logger.debug(
+            f"Current block: {current_block},"
+            + f" Blocks elapsed: {blocks_elapsed}"
+        )
 
-    def save_state(self):
-        """Save hotkeys, neuron model and moving average scores to filesystem."""
-        logger.info("Saving current validator state...")
-        try:
-            neuron_state_dict = {
-                "neuron_weights": self.moving_average_scores.to("cpu").tolist(),
-            }
-            torch.save(
-                neuron_state_dict, f"{self.config.alchemy.full_path}/model.torch"
-            )
-            colored_log(
-                f"Saved model {self.config.alchemy.full_path}/model.torch",
-                color="blue",
-            )
-            # empty cache
-            torch.cuda.empty_cache()
-            logger.info("Saved current validator state.")
-        except Exception as e:
-            logger.error(f"Failed to save model with error: {e}")
+        epoch_length: int = self.config.alchemy.epoch_length
 
-    def load_state(self):
-        """Load hotkeys and moving average scores from filesystem."""
-        logger.info("Loading previously saved validator state...")
-        try:
-            state_dict = torch.load(f"{self.config.alchemy.full_path}/model.torch")
-            neuron_weights = torch.tensor(state_dict["neuron_weights"])
+        should_set = blocks_elapsed >= epoch_length
 
-            has_nans = torch.isnan(neuron_weights).any()
-            has_infs = torch.isinf(neuron_weights).any()
-
-            if has_nans:
-                logger.info(f"Nans found in the model state: {has_nans}")
-
-            if has_infs:
-                logger.info(f"Infs found in the model state: {has_infs}")
-
-            # Check to ensure that the size of the neruon
-            # weights matches the metagraph size.
-            if neuron_weights.shape != (self.metagraph.n,):
-                logger.warning(
-                    f"Neuron weights shape {neuron_weights.shape} "
-                    + f"does not match metagraph n {self.metagraph.n}"
-                    "Populating new moving_averaged_scores IDs with zeros"
-                )
-                self.moving_average_scores[: len(neuron_weights)] = neuron_weights.to(
-                    self.device
-                )
-                # self.update_hotkeys()
-
-            # Check for nans in saved state dict
-            elif not any([has_nans, has_infs]):
-                self.moving_average_scores = neuron_weights.to(self.device)
-                logger.info(f"MA scores: {self.moving_average_scores}")
-                # self.update_hotkeys()
-            else:
-                logger.info("Loaded MA scores from scratch.")
-
-            # Zero out any negative scores
-            for i, average in enumerate(self.moving_average_scores):
-                if average < 0:
-                    self.moving_average_scores[i] = 0
-
+        # Calculate and log the approximate time until next weight set
+        if not should_set:
+            blocks_until_next_set = epoch_length - blocks_elapsed
+            # Assuming an average block time of 12 seconds
+            seconds_until_next_set = blocks_until_next_set * 12
+            minutes_until_next_set = ceil(seconds_until_next_set / 60)
             logger.info(
-                f"Loaded model {self.config.alchemy.full_path}/model.torch",
+                "Next weight set in approximately "
+                f"{minutes_until_next_set} minutes "
+                f"({blocks_until_next_set} blocks)"
             )
 
-        except Exception as e:
-            logger.error(f"Failed to load model with error: {e}")
+        logger.info(f"Should set weights: {should_set}")
+
+        return should_set
 
     def serve_axon(self):
         """Serve axon to enable external connections."""
@@ -685,4 +614,90 @@ class StableValidator:
                 logger.error(f"Failed to serve Axon with exception: {e}")
 
         except Exception as e:
-            logger.error(f"Failed to create Axon initialize with exception: {e}")
+            logger.error(
+                f"Failed to create Axon initialize with exception: {e}"
+            )
+
+    async def run(self):
+        logger.info("Starting validator loop.")
+        self.step = 0
+
+        while not self.should_quit.is_set():
+            try:
+                logger.info(
+                    f"Started new validator run ({validator_run_id.get()})."
+                )
+
+                if await self.pre_step():
+                    if await self.mid_step():
+                        await self.post_step()
+
+                self.step += 1
+
+            except KeyboardInterrupt:
+                logger.success(
+                    "Keyboard interrupt detected. Exiting validator."
+                )
+                break
+            except Exception:
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(5)
+
+        self.stop_processes()
+
+    async def pre_step(self):
+        try:
+            self.task = await self.get_image_generation_task()
+            if not self.task:
+                logger.warning(
+                    "Image generation task was not generated successfully."
+                )
+                return False
+
+            return True
+        except Exception:
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(10)
+            return False
+
+    async def mid_step(self):
+        try:
+            selected_uids: torch.Tensor = await select_uids(count=12)
+            if selected_uids.numel() == 0:
+                logger.info("No active miners found, retrying in 20 seconds...")
+                await asyncio.sleep(20)
+                return False
+
+            axons = [self.metagraph.axons[uid] for uid in selected_uids]
+
+            await run_step(
+                validator=self,
+                task=self.task,
+                axons=axons,
+                uids=selected_uids,
+                model_type=self.model_type,
+                stats=self.stats,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Mid-step failed: {traceback.format_exc()}")
+            return False
+
+    async def post_step(self):
+        for method in [
+            self.sync,
+            self.reload_settings,
+            self.start_threads,
+            self.update_check,
+            lambda: save_ma_scores(self.moving_average_scores),
+        ]:
+            try:
+                logger.info(f"Running post step: {method.__name__}")
+                if inspect.iscoroutinefunction(method):
+                    await method()
+                else:
+                    method()
+            except Exception as e:
+                logger.error(
+                    f"{method.__name__} failed: " + traceback.format_exc()
+                )

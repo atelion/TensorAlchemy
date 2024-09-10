@@ -2,7 +2,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from neurons.validator.rewards.types import RewardModelType
+from scoring.models.types import RewardModelType
 
 
 def convert_enum_keys_to_strings(data) -> dict:
@@ -58,8 +58,9 @@ class EventSchema:
 
         rewards = convert_enum_keys_to_strings(
             {
-                RewardModelType.BLACKLIST: event_dict.get(RewardModelType.BLACKLIST),
-                RewardModelType.SIMILARITY: event_dict.get(RewardModelType.SIMILARITY),
+                RewardModelType.BLACKLIST: event_dict.get(
+                    RewardModelType.BLACKLIST
+                ),
                 RewardModelType.HUMAN: event_dict.get(RewardModelType.HUMAN),
                 RewardModelType.IMAGE: event_dict.get(RewardModelType.IMAGE),
                 RewardModelType.NSFW: event_dict.get(RewardModelType.NSFW),

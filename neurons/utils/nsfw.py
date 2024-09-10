@@ -26,7 +26,9 @@ def load_nsfw_words(url: str) -> List[str]:
         return words
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error occurred while loading NSFW words from {url}: {str(e)}")
+        logger.error(
+            f"Error occurred while loading NSFW words from {url}: {str(e)}"
+        )
         return NSFW_WORDLIST_DEFAULT
 
 

@@ -15,7 +15,8 @@ from tenacity import (
 )
 
 
-from neurons.constants import DEV_URL, PROD_URL
+from neurons.constants import DEVELOP_URL, TESTNET_URL, MAINNET_URL
+from neurons.exceptions import StakeBelowThreshold
 from neurons.protocol import denormalize_image_model, ImageGenerationTaskModel
 from neurons.validator.backend.exceptions import (
     GetVotesError,
@@ -24,7 +25,7 @@ from neurons.validator.backend.exceptions import (
     PostWeightsError,
     UpdateTaskError,
 )
-from neurons.validator.config import get_config, add_args
+from neurons.config import get_config
 from neurons.validator.backend.models import TaskState
 from neurons.validator.schemas import Batch
 
@@ -38,12 +39,13 @@ class TensorAlchemyBackendClient:
         else:
             self.hotkey = bt.wallet(config=self.config).hotkey
 
-        self.api_url = DEV_URL
-        if self.config.subtensor.network != "test":
-            self.api_url = PROD_URL
+        self.api_url = MAINNET_URL
 
-        if self.config.alchemy.force_prod:
-            self.api_url = PROD_URL
+        if self.config.netuid == 25:
+            self.api_url = DEVELOP_URL
+
+            if self.config.alchemy.host == "testnet":
+                self.api_url = TESTNET_URL
 
         logger.info(f"Using backend server {self.api_url}")
 
@@ -60,7 +62,7 @@ class TensorAlchemyBackendClient:
         )
 
     # Get tasks from the client server
-    async def poll_task(self, timeout: int = 60, backoff: int = 1):
+    async def poll_task(self, timeout: int = 30, backoff: int = 1):
         """Performs polling for new task.
         If no new task found within `timeout`
         returns None."""
@@ -88,29 +90,47 @@ class TensorAlchemyBackendClient:
 
         return await _poll_task_with_retry()
 
-    async def get_task(self, timeout: int = 3) -> ImageGenerationTaskModel | None:
+    async def get_task(
+        self, timeout: int = 3
+    ) -> ImageGenerationTaskModel | None:
         """Fetch new task from backend.
 
         Returns task or None if there is no pending task
         """
         try:
             async with self._client() as client:
-                response = await client.get(f"{self.api_url}/tasks", timeout=timeout)
+                response = await client.get(
+                    f"{self.api_url}/tasks", timeout=timeout
+                )
+
         except httpx.ReadTimeout as ex:
             raise GetTaskError(f"/tasks read timeout ({timeout}s)") from ex
         except Exception as ex:
             raise GetTaskError("/tasks unknown error") from ex
 
+        try:
+            task: Dict = response.json()
+        except Exception:
+            pass
+
         if response.status_code == 200:
-            task = response.json()
             logger.info(f"[get_task] task={task}")
             return denormalize_image_model(**task)
+
+        if response.status_code == 403:
+            if task.get("code") == "STAKE_BELOW_THRESHOLD":
+                return None
+
         if response.status_code == 404:
-            try:
-                if response.json().get("code") == "NO_TASKS_FOUND":
-                    return None
-            except Exception:
-                pass
+            return None
+
+        if response.status_code == 401:
+            if task.get("code") == "VALIDATOR_NOT_FOUND_YET":
+                return None
+            if task.get("code") == "PENDING_SYNC_METAGRAPH":
+                return None
+            if task.get("code") == "VALIDATOR_HAS_NOT_ENOUGH_STAKE":
+                return None
 
         raise GetTaskError(
             f"/tasks failed with status_code {response.status_code}:"
@@ -121,7 +141,9 @@ class TensorAlchemyBackendClient:
         """Get human votes from backend"""
         try:
             async with self._client() as client:
-                response = await client.get(f"{self.api_url}/votes", timeout=timeout)
+                response = await client.get(
+                    f"{self.api_url}/votes", timeout=timeout
+                )
         except httpx.ReadTimeout:
             raise GetVotesError(f"/votes read timeout({timeout}s)")
 
@@ -165,15 +187,43 @@ class TensorAlchemyBackendClient:
                 f"{response.status_code}: {self._error_response_text(response)}"
             )
 
+    async def fail_task(self, task_id: str, timeout: int = 10) -> Response:
+        """Task failed for some reason"""
+        try:
+            async with self._client() as client:
+                response = await client.post(
+                    f"{self.api_url}/tasks/{task_id}/fail",
+                    timeout=timeout,
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to fail task {str(e)}")
+
+        return response
+
     async def post_batch(self, batch: Batch, timeout: int = 10) -> Response:
         """Post batch of images"""
-        async with self._client() as client:
-            response = await client.post(
-                f"{self.api_url}/batches",
-                json=batch.dict(),
-                timeout=timeout,
-            )
-        return response
+        try:
+            async with self._client() as client:
+                response = await client.post(
+                    f"{self.api_url}/batches",
+                    json=batch.model_dump(),
+                    timeout=timeout,
+                )
+
+                if response.status_code == 200:
+                    response_data = await response.json()
+                    if response_data.get("code") == "STAKE_BELOW_THRESHOLD":
+                        raise StakeBelowThreshold("Stake is below the required threshold.")
+
+                return response
+
+        except StakeBelowThreshold as e:
+            logger.error(f"StakeBelowThreshold: {str(e)}")
+            raise
+
+        except Exception as e:
+            logger.error(f"Failed to upload batch: {str(e)}")
 
     async def post_weights(
         self, hotkeys: List[str], raw_weights: torch.Tensor, timeout: int = 10
@@ -186,7 +236,9 @@ class TensorAlchemyBackendClient:
                     json={
                         "weights": {
                             hotkey: moving_average.item()
-                            for hotkey, moving_average in zip(hotkeys, raw_weights)
+                            for hotkey, moving_average in zip(
+                                hotkeys, raw_weights
+                            )
                         }
                     },
                     timeout=timeout,
@@ -238,7 +290,9 @@ class TensorAlchemyBackendClient:
 
             signature = self._sign_message(message)
 
-            request.headers.update({"X-Signature": signature, "X-Timestamp": timestamp})
+            request.headers.update(
+                {"X-Signature": signature, "X-Timestamp": timestamp}
+            )
         except Exception as e:
             logger.error(
                 f"Exception raised while signing request: {e}; sending plain old request"
@@ -249,9 +303,13 @@ class TensorAlchemyBackendClient:
         try:
             from neurons.validator.utils.version import get_validator_version
 
-            request.headers.update({"X-Validator-Version": get_validator_version()})
+            request.headers.update(
+                {"X-Validator-Version": get_validator_version()}
+            )
         except Exception:
-            logger.error(f"Exception raised while including validator's version")
+            logger.error(
+                f"Exception raised while including validator's version"
+            )
 
     def _sign_message(self, message: str):
         """Sign message using validator's hotkey"""

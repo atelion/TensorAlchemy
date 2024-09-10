@@ -1,49 +1,45 @@
+import json
 import asyncio
-import base64
-import copy
 import time
-from typing import (
-    AsyncIterator,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
-from dataclasses import asdict
 from datetime import datetime
-from io import BytesIO
 
 import bittensor as bt
 import torch
 import torchvision.transforms as T
-import wandb as wandb_lib
 from bittensor import AxonInfo
 from loguru import logger
-from pydantic import BaseModel
 
 from neurons.constants import MOVING_AVERAGE_ALPHA
 from neurons.protocol import ImageGeneration, ImageGenerationTaskModel
 
+from neurons.utils.exceptions import BittensorBrokenPipe
 from neurons.utils.defaults import Stats
-from neurons.utils.log import colored_log, sh
+from neurons.utils.log import image_to_str
+from neurons.utils.image import (
+    synapse_to_base64,
+    empty_image_tensor,
+)
 
 from neurons.validator.backend.exceptions import PostMovingAveragesError
 from neurons.validator.event import EventSchema, convert_enum_keys_to_strings
 from neurons.validator.schemas import Batch
 from neurons.validator.utils import ttl_get_block
-from neurons.validator.rewards.types import RewardModelType
-from neurons.validator.config import (
+from scoring.models.types import RewardModelType
+from neurons.config import (
+    get_config,
     get_device,
+    get_wallet,
     get_metagraph,
     get_backend_client,
+    get_blacklist,
 )
-from neurons.validator.rewards.types import (
+from scoring.types import (
     ScoringResult,
     ScoringResults,
 )
-from neurons.validator.rewards.pipeline import (
-    filter_rewards,
+from scoring.pipeline import (
     get_scoring_results,
     apply_masking_functions,
 )
@@ -51,21 +47,34 @@ from neurons.validator.rewards.pipeline import (
 transform = T.Compose([T.PILToTensor()])
 
 
+def log_moving_averages_for_grafana(
+    moving_average_scores: torch.FloatTensor,
+) -> None:
+    list_ma: List[float] = moving_average_scores.tolist()
+
+    for uid in range(moving_average_scores.numel()):
+        try:
+            score = float(list_ma[uid])
+            if score > 0:
+                logger.info(
+                    f"miner_uid={uid}, miner_score={score:.4f}",
+                )
+        except IndexError:
+            continue
+
+        except Exception as e:
+            logger.error(str(e))
+
+
 async def update_moving_averages(
     previous_ma_scores: torch.FloatTensor,
-    rewards: torch.FloatTensor,
-    hotkey_blacklist: Optional[List[str]] = None,
-    coldkey_blacklist: Optional[List[str]] = None,
+    scoring_results: ScoringResults,
     alpha: Optional[float] = MOVING_AVERAGE_ALPHA,
 ) -> torch.FloatTensor:
-    if not hotkey_blacklist:
-        hotkey_blacklist = []
-    if not coldkey_blacklist:
-        coldkey_blacklist = []
     metagraph: bt.metagraph = get_metagraph()
 
     rewards = torch.nan_to_num(
-        rewards,
+        scoring_results.combined_scores,
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
@@ -80,7 +89,9 @@ async def update_moving_averages(
 
     # Number of miners has reduced (less miners online now)
     elif rewards.size(0) < previous_ma_scores.size(0):
-        logger.warning("Fewer miners than expected. Truncating moving averages.")
+        logger.warning(
+            "Fewer miners than expected. Truncating moving averages."
+        )
         previous_ma_scores = previous_ma_scores[: rewards.size(0)]
 
     # We merge the new rewards into the moving average using ALPHA
@@ -93,51 +104,60 @@ async def update_moving_averages(
     #
     # So the result is:
     # (0.01 * 0.5) + (1.0 - 0.01) * 1.00 = 0.995
-    moving_average_scores: torch.FloatTensor = alpha * rewards + (
+    new_moving_average_scores = alpha * rewards + (
         1 - alpha
     ) * previous_ma_scores.to(get_device())
+
+    # Scatter the scores into the moving average scores
+    updated_ma_scores = previous_ma_scores.clone()
+
+    uids_to_scatter: torch.Tensor = scoring_results.combined_uids.to(torch.long)
+    logger.info(f"Scattering MA deltas over UIDS {uids_to_scatter}")
+
+    # Now each step we apply a small decay to the weights
+    # this prevents miners from just turning off and still getting rewarded
+    updated_ma_scores *= 1.0 - get_config().alchemy.ma_decay
+
+    # But actually set scores for the miners who replied to us
+    # This prevents overly negatively weighting the miner response over time
+    updated_ma_scores[uids_to_scatter] = new_moving_average_scores[
+        uids_to_scatter
+    ]
+
+    # Ensure values don't go below zero
+    updated_ma_scores = torch.clamp(updated_ma_scores, min=0)
+
+    # Outputs MA scores for grafana
+    log_moving_averages_for_grafana(updated_ma_scores)
 
     # Save moving averages scores on backend
     try:
         await get_backend_client().post_moving_averages(
             metagraph.hotkeys,
-            moving_average_scores,
+            updated_ma_scores,
         )
     except PostMovingAveragesError as e:
         logger.error(f"failed to post moving averages: {e}")
 
     try:
+        hotkey_blacklist, coldkey_blacklist = await get_blacklist()
+
         for i, (hotkey, coldkey) in enumerate(
             zip(metagraph.hotkeys, metagraph.coldkeys)
         ):
             if hotkey in hotkey_blacklist or coldkey in coldkey_blacklist:
-                moving_average_scores[i] = 0
+                updated_ma_scores[i] = 0
 
     except Exception as e:
         logger.error(f"An unexpected error occurred (E1): {e}")
 
-    return moving_average_scores
-
-
-class ImageGenerationResponse(BaseModel):
-    axon: AxonInfo
-    synapse: ImageGeneration
-    time: float
-    uid: Optional[int] = None
-
-    def has_images(self) -> bool:
-        return len(self.images) > 0
-
-    @property
-    def images(self):
-        return self.synapse.images
+    return updated_ma_scores
 
 
 async def query_axons_async(
     dendrite: bt.dendrite,
     axons: List[bt.AxonInfo],
     synapse: bt.Synapse,
-    query_timeout: int,
 ) -> AsyncIterator[Tuple[int, bt.Synapse]]:
     """
     Asynchronously queries a list of axons and yields the responses.
@@ -145,7 +165,6 @@ async def query_axons_async(
         dendrite (bt.dendrite): The dendrite instance to use for querying.
         axons (List[AxonInfo]): The list of axons to query.
         synapse (bt.Synapse): The synapse object to use for the query.
-        query_timeout (int): The timeout duration for the query.
     Yields:
         Tuple[int, bt.Synapse]: The UID of the axon and the filled Synapse object.
     """
@@ -160,7 +179,7 @@ async def query_axons_async(
         #       Please use `forward` for now
         to_return: List[bt.Synapse] = await dendrite.forward(
             synapse=synapse,
-            timeout=query_timeout,
+            timeout=get_config().alchemy.query_timeout,
             axons=[inbound_axon],
         )
 
@@ -180,7 +199,6 @@ async def query_axons_and_process_responses(
     task: ImageGenerationTaskModel,
     axons: List[AxonInfo],
     synapse: bt.Synapse,
-    query_timeout: int,
 ) -> List[bt.Synapse]:
     """Request image generation from axons"""
     responses = []
@@ -188,7 +206,6 @@ async def query_axons_and_process_responses(
         validator.dendrite,
         axons,
         synapse,
-        query_timeout,
     ):
         masked_rewards: ScoringResults = await apply_masking_functions(
             validator.model_type,
@@ -198,112 +215,73 @@ async def query_axons_and_process_responses(
 
         # Create batch from single response and enqueue uploading
         # Batch will be merged at backend side
-        batch_for_upload: Batch = await create_batch_for_upload(
-            validator_wallet=validator.wallet,
-            metagraph=validator.metagraph,
-            batch_id=task.task_id,
-            prompt=task.prompt,
-            responses=[response],
-            masked_rewards=masked_rewards,
-        )
+        try:
+            await create_batch_for_upload(
+                validator,
+                batch_id=task.task_id,
+                prompt=task.prompt,
+                responses=[response],
+                masked_rewards=masked_rewards,
+            )
+        except InvalidBatch:
+            await get_backend_client().fail_task(task.task_id)
 
         responses.append(response)
-
-        if batch_for_upload:
-            try:
-                validator.batches_upload_queue.put_nowait(batch_for_upload)
-            except Exception as e:
-                logger.error(f"Could not add compute to upload queue {e}")
 
     return responses
 
 
-def log_query_to_history(validator: "StableValidator", uids: torch.Tensor):
-    try:
-        for uid in uids:
-            validator.miner_query_history_duration[
-                validator.metagraph.axons[uid].hotkey
-            ] = time.perf_counter()
-        for uid in uids:
-            validator.miner_query_history_count[
-                validator.metagraph.axons[uid].hotkey
-            ] += 1
-    except Exception as e:
-        logger.error(
-            f"Failed to log miner counts and histories due to the following error: {e}"
-        )
-
-    colored_log(
-        f"{sh('Miner Counts')} -> Max: {max(validator.miner_query_history_count.values()):.2f} "
-        f"| Min: {min(validator.miner_query_history_count.values()):.2f} "
-        f"| Mean: {sum(validator.miner_query_history_count.values()) / len(validator.miner_query_history_count.values()):.2f}",
-        color="yellow",
-    )
-
-
 def log_responses(responses: List[ImageGeneration], prompt: str):
     try:
-        formatted_responses = [
-            {
-                "negative_prompt": response.negative_prompt,
-                "prompt_image": response.prompt_image,
-                "num_images_per_prompt": response.num_images_per_prompt,
-                "height": response.height,
-                "width": response.width,
-                "seed": response.seed,
-                "steps": response.steps,
-                "guidance_scale": response.guidance_scale,
-                "generation_type": response.generation_type,
-                "images": [image.shape for image in response.images],
-            }
-            for response in responses
-        ]
         logger.info(
-            f"Received {len(responses)} response(s) for the prompt '{prompt}': {formatted_responses}"
+            #
+            f"Received {len(responses)} response(s) for the prompt "
+            + prompt
         )
+
+        for response in responses:
+            logger.info(
+                json.dumps(
+                    {
+                        "axon_ip": response.axon.ip,
+                        "axon_hotkey": response.axon.hotkey,
+                        "negative_prompt": response.negative_prompt,
+                        "prompt_image": response.prompt_image,
+                        "num_images_per_prompt": response.num_images_per_prompt,
+                        "height": response.height,
+                        "width": response.width,
+                        "seed": response.seed,
+                        "steps": response.steps,
+                        "guidance_scale": response.guidance_scale,
+                        "generation_type": response.generation_type,
+                        "images": [
+                            image_to_str(image) for image in response.images
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+
     except Exception as e:
         logger.error(f"Failed to log formatted responses: {e}")
 
 
-def log_event_to_wandb(wandb, event: dict, prompt: str):
-    event = convert_enum_keys_to_strings(event)
+def log_event(event: dict):
+    event = EventSchema.from_dict(convert_enum_keys_to_strings(event))
+    # Reduce img output
+    event.images = [image_to_str(img) for img in event.images]
+    logger.info(f"[log_event]: {event}")
 
-    logger.info(f"Events: {str(event)}")
 
-    # Log the event to wandb.
-    wandb_event = copy.deepcopy(event)
-    file_type = "png"
-
-    def gen_caption(prompt, i):
-        return f"{prompt}\n({event['uids'][i]} | {event['hotkeys'][i]})"
-
-    for e, image in enumerate(wandb_event["images"]):
-        wandb_img = (
-            torch.full([3, 1024, 1024], 255, dtype=torch.float)
-            if image == []
-            else bt.Tensor.deserialize(image)
-        )
-
-        wandb_event["images"][e] = wandb_lib.Image(
-            wandb_img,
-            caption=gen_caption(prompt, e),
-            file_type=file_type,
-        )
-
-    wandb_event = EventSchema.from_dict(wandb_event)
-
-    try:
-        wandb.log(asdict(wandb_event))
-    except Exception as e:
-        logger.error(f"Unable to log event to wandb due to the following error: {e}")
+class InvalidBatch(Exception):
+    pass
 
 
 async def create_batch_for_upload(
-    validator_wallet: bt.wallet,
-    metagraph: "bt.metagraph.Metagraph",
+    validator: "StableValidator",
     batch_id: str,
     prompt: str,
-    responses: List[ImageGenerationResponse],
+    responses: List[bt.Synapse],
     masked_rewards: ScoringResults,
 ) -> Optional[Batch]:
     should_drop_entries = []
@@ -313,16 +291,8 @@ async def create_batch_for_upload(
     rewards_for_uids = masked_rewards.combined_scores[uids]
 
     for response, reward in zip(responses, rewards_for_uids):
-        im_file = BytesIO()
         if response.images:
-            T.transforms.ToPILImage()(
-                bt.Tensor.deserialize(response.images[0]),
-            ).save(im_file, format="PNG")
-
-            # im_bytes: image in binary format.
-            im_bytes = im_file.getvalue()
-            im_b64 = base64.b64encode(im_bytes)
-            images.append(im_b64.decode())
+            images.append(synapse_to_base64(response))
 
             if response.is_success and reward.item() == 0:
                 should_drop_entries.append(0)
@@ -333,6 +303,10 @@ async def create_batch_for_upload(
         else:
             images.append("NO_IMAGE")
             should_drop_entries.append(1)
+            continue
+
+    if not len(images):
+        raise InvalidBatch()
 
     nsfw_scores: Optional[ScoringResult] = masked_rewards.get_score(
         RewardModelType.NSFW,
@@ -342,10 +316,13 @@ async def create_batch_for_upload(
     )
 
     if not nsfw_scores:
-        return None
+        raise InvalidBatch()
 
     if not blacklist_scores:
-        return None
+        raise InvalidBatch()
+
+    wallet: bt.wallet = get_wallet()
+    metagraph: bt.metagraph = get_metagraph()
 
     # Update batches to be sent to the human validation platform
     # if batch_id not in validator.batches.keys():
@@ -354,7 +331,7 @@ async def create_batch_for_upload(
         computes=images,
         batch_id=batch_id,
         should_drop_entries=should_drop_entries,
-        validator_hotkey=str(validator_wallet.hotkey.ss58_address),
+        validator_hotkey=str(wallet.hotkey.ss58_address),
         miner_hotkeys=[metagraph.hotkeys[uid] for uid in uids],
         miner_coldkeys=[metagraph.coldkeys[uid] for uid in uids],
         # Scores
@@ -366,22 +343,20 @@ async def create_batch_for_upload(
 def display_run_info(stats: Stats, task_type: str, prompt: str):
     time_elapsed = datetime.now() - stats.start_time
 
-    colored_log(
-        sh("Info")
+    logger.info(
+        "Info"
         + f"-> Date {datetime.strftime(stats.start_time, '%Y/%m/%d %H:%M')}"
         + f" | Elapsed {time_elapsed}"
         + f" | RPM {stats.total_requests / (time_elapsed.total_seconds() / 60):.2f}",
-        color="green",
     )
-    colored_log(
-        f"{sh('Request')} -> Type: {task_type}"
+    logger.info(
+        "Request"
+        + f" -> Type: {task_type}"
         + f" | Total requests sent {stats.total_requests:,}"
         + f" | Timeouts {stats.timeouts:,}",
-        color="cyan",
     )
-    colored_log(
-        f"{sh('Prompt')} -> {prompt}",
-        color="yellow",
+    logger.info(
+        f"Prompt -> {prompt}",
     )
 
 
@@ -429,39 +404,27 @@ async def run_step(
         model_type=model_type,
     )
 
-    synapse_info = (
-        f"Timeout: {synapse.timeout:.2f} "
-        f"| Height: {synapse.height} "
-        f"| Width: {synapse.width}"
-    )
-
     responses = await query_axons_and_process_responses(
         validator,
         task,
         axons,
         synapse,
-        validator.query_timeout,
     )
-
-    log_query_to_history(validator, uids)
 
     uids = get_uids(responses)
 
-    colored_log(f"{sh('Info')} -> {synapse_info}", color="magenta")
-    colored_log(
-        f"{sh('UIDs')} -> {' | '.join([str(uid) for uid in uids])}",
-        color="yellow",
+    logger.info(
+        f"UIDs -> {' | '.join([str(uid.item()) for uid in uids])}",
     )
 
     validator_info = validator.get_validator_info()
-    colored_log(
-        f"{sh('Stats')} -> Block: {validator_info['block']} "
+    logger.info(
+        f"Stats -> Block: {validator_info['block']} "
         f"| Stake: {validator_info['stake']:.4f} "
         f"| Rank: {validator_info['rank']:.4f} "
         f"| VTrust: {validator_info['vtrust']:.4f} "
         f"| Dividends: {validator_info['dividends']:.4f} "
         f"| Emissions: {validator_info['emissions']:.4f}",
-        color="cyan",
     )
 
     stats.total_requests += 1
@@ -469,7 +432,8 @@ async def run_step(
     start_time = time.time()
 
     # Log the results for monitoring purposes.
-    log_responses(responses, prompt)
+    if get_config().DEBUG:
+        log_responses(responses, prompt)
 
     # Calculate rewards
     scoring_results: ScoringResults = await get_scoring_results(
@@ -477,24 +441,30 @@ async def run_step(
         synapse,
         responses,
     )
+    # Log CLIP and IMAGE rewards
+    clip_rewards = scoring_results.get_score(RewardModelType.ENHANCED_CLIP)
+    image_rewards = scoring_results.get_score(RewardModelType.IMAGE)
 
-    # Apply isalive filtering
-    rewards_tensor_adjusted = filter_rewards(
-        validator.isalive_dict,
-        validator.isalive_threshold,
-        # No need for scattering, directly use the rewards
-        scoring_results.combined_scores,
-    )
+    if clip_rewards is not None and image_rewards is not None:
+        clip_scores = clip_rewards.normalized[uids]
+        image_scores = image_rewards.normalized[uids]
+
+        for uid, clip_score, image_score in zip(
+            uids, clip_scores, image_scores
+        ):
+            logger.info(
+                f"UID: {uid.item()} - CLIP score: {clip_score.item():.4f}, IMAGE score: {image_score.item():.4f}"
+            )
+    else:
+        logger.warning("CLIP or IMAGE rewards not found in scoring results")
 
     # Update moving averages
     validator.moving_average_scores = await update_moving_averages(
         validator.moving_average_scores,
-        rewards_tensor_adjusted,
-        hotkey_blacklist=validator.hotkey_blacklist,
-        coldkey_blacklist=validator.coldkey_blacklist,
+        scoring_results,
     )
 
-    # Update event and save it to wandb
+    # Create event for logging
     event: Dict = {}
     rewards_list = scoring_results.combined_scores[uids].tolist()
 
@@ -506,7 +476,7 @@ async def run_step(
         event.update(
             {
                 "task_type": task_type,
-                "block": ttl_get_block(validator),
+                "block": ttl_get_block(),
                 "step_length": time.time() - start_time,
                 "prompt": prompt if task_type == "TEXT_TO_IMAGE" else None,
                 "uids": uids,
@@ -514,8 +484,8 @@ async def run_step(
                 "images": [
                     (
                         response.images[0]
-                        if (response.images != []) and (reward != 0)
-                        else []
+                        if (response.images != [])
+                        else empty_image_tensor()
                     )
                     for response, reward in zip(responses, rewards_list)
                 ],
@@ -524,17 +494,17 @@ async def run_step(
             }
         )
         event.update(validator_info)
+
+    # Should stop & restart the validator
+    except BittensorBrokenPipe:
+        raise
+
     except Exception as err:
         logger.error(f"Error updating event dict: {err}")
 
     try:
-        log_event_to_wandb(
-            validator.wandb,
-            event,
-            prompt,
-        )
-        logger.info("Logged event to wandb.")
+        log_event(event)
     except Exception as e:
-        logger.error(f"Failed while logging to wandb: {e}")
+        logger.error(f"Failed while logging event: {e}")
 
     return event

@@ -10,7 +10,7 @@ class MockTensorAlchemyBackendClient:
 
     async def poll_task(
         self,
-        _timeout: int = 60,
+        _timeout: int = 30,
         _backoff: int = 1,
     ):
         return AsyncMock()()

@@ -39,9 +39,8 @@ source ~/venvs/TensorAlchemy/bin/activate && cd ~/TensorAlchemy && pip install -
 
 ### STEP 5. LAUNCH MINER
 ```bash
-python ~/TensorAlchemy/neurons/miners/StableMiner/main.py --wallet.name NAME --wallet.hotkey HOTKEY --netuid 25 --subtensor.network test --axon.port 8101 --miner.device cuda:0 --wandb.entity ENTITY --wandb.project PROJECT --wandb.api_key APIKEY
+python ~/TensorAlchemy/neurons/miners/StableMiner/main.py --wallet.name NAME --wallet.hotkey HOTKEY --netuid 25 --subtensor.network test --axon.port 8101 --miner.device cuda:0
 ```
 
 ### NOTES
 - ⚗️ TensorAlchemy is netuid 26 on production however it is netuid 25 on the testnet.
-- ⚗️ You can remove the wandb options from the start command if you don’t want to log your miner’s images directly to your own wandb account.

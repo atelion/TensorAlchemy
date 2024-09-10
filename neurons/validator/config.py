@@ -1,154 +1,179 @@
+"""
+Configuration parsing and management utilities for the Alchemy project.
+"""
+
 import os
 import argparse
-from typing import Optional
-
-import torch
+from typing import Dict
 import bittensor as bt
 from loguru import logger
 
-from neurons.constants import EVENTS_RETENTION_SIZE
-
-IS_TEST: bool = False
-
-
-def get_default_device() -> torch.device:
-    if IS_TEST:
-        logger.info("Using CPU for test environment (CI)")
-        return torch.device("cpu:0")
-
-    return torch.device("cuda:0")
+from neurons.config.constants import AlchemyHost
+from neurons.config.device import get_default_device
+from neurons.utils.settings import download_validator_settings
 
 
-def check_config(to_check: bt.config):
-    """Checks/validates the config namespace object."""
-    bt.logging.check_config(to_check)
-    # bt.wallet.check_config(config)
-    # bt.subtensor.check_config(config)
+def add_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add Alchemy-specific arguments to the argument parser.
 
-    if to_check.mock:
-        to_check.neuron.mock_reward_models = True
-        to_check.neuron.mock_gating_model = True
-        to_check.neuron.mock_dataset = True
-        to_check.wallet._mock = True
-
-    full_path = os.path.expanduser(
-        "{}/{}/{}/netuid{}/{}".format(
-            to_check.logging.logging_dir,
-            to_check.wallet.name,
-            to_check.wallet.hotkey,
-            to_check.netuid,
-            to_check.alchemy.name,
-        )
-    )
-    to_check.alchemy.full_path = os.path.expanduser(full_path)
-    if not os.path.exists(to_check.alchemy.full_path):
-        os.makedirs(to_check.alchemy.full_path, exist_ok=True)
-
-    # Add custom event logger for the events.
-    logger.level("EVENTS", no=38, icon="📝")
-    logger.add(
-        to_check.alchemy.full_path + "/" + "completions.log",
-        rotation=EVENTS_RETENTION_SIZE,
-        serialize=True,
-        enqueue=True,
-        backtrace=False,
-        diagnose=False,
-        level="EVENTS",
-        format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {message}",
-    )
-
-
-def add_args(parser):
-    # Netuid Arg
+    Args:
+        parser (argparse.ArgumentParser): The argument parser to add arguments
+    """
     parser.add_argument(
         "--netuid",
         type=int,
         help="Network netuid",
         default=26,
     )
-
     parser.add_argument(
         "--alchemy.name",
         type=str,
-        help="Trials for this validator go in validator.root"
-        + " / (wallet_cold - wallet_hot) / validator.name.",
-        default="image_alchemy_validator",
+        help="Validator name",
+        default="tensor_alchemy_validator",
+    )
+    parser.add_argument(
+        "--alchemy.debug",
+        type=bool,
+        default=False,
+        help="Enable debug logging",
     )
     parser.add_argument(
         "--alchemy.device",
         type=str,
-        help="Device to run the validator on.",
         default=get_default_device(),
+        help="Device to run the validator on",
     )
     parser.add_argument(
-        "--alchemy.force_prod",
-        action="store_true",
-        default=False,
+        "--alchemy.host",
+        type=AlchemyHost,
+        choices=list(AlchemyHost),
+        help="Choose the Alchemy host",
     )
     parser.add_argument(
-        "--alchemy.streamlit_port",
+        "--alchemy.ma_decay",
+        type=float,
+        default=0.000001,
+        help="How much do the moving averages decay each step?",
+    )
+    parser.add_argument(
+        "--alchemy.request_frequency",
         type=int,
-        help="Port number for streamlit app",
-        default=None,
+        default=35,
+        help="Request frequency for the validator",
+    )
+    parser.add_argument(
+        "--alchemy.query_timeout",
+        type=float,
+        default=20,
+        help="Query timeout for the validator",
+    )
+    parser.add_argument(
+        "--alchemy.async_timeout",
+        type=float,
+        default=2.0,
+        help="Async timeout for the validator",
+    )
+    parser.add_argument(
+        "--alchemy.epoch_length",
+        type=int,
+        default=100,
+        help="Epoch length for the validator",
     )
 
 
-config: bt.config = None
-device: torch.device = None
-metagraph: bt.metagraph = None
-backend_client: "TensorAlchemyBackendClient" = None
+def check_config(to_check: bt.config) -> None:
+    """
+    Check and validate the configuration object.
+
+    Args:
+        to_check (bt.config): The configuration object to check.
+    """
+    bt.logging.check_config(to_check)
+
+    full_path = os.path.expanduser(
+        to_check.logging.logging_dir
+        + f"/{to_check.wallet.name}"
+        + f"/{to_check.wallet.hotkey}"
+        + f"/netuid{to_check.netuid}"
+        + f"/{to_check.alchemy.name}"
+    )
+    to_check.alchemy.full_path = os.path.expanduser(full_path)
+    os.makedirs(to_check.alchemy.full_path, exist_ok=True)
 
 
-def get_config():
+def get_config() -> bt.config:
+    """
+    Get the global configuration object.
+
+    Returns:
+        bt.config: The global configuration object.
+    """
     global config
-    if config:
-        return config
-
-    parser = argparse.ArgumentParser()
-
-    bt.wallet.add_args(parser)
-    bt.subtensor.add_args(parser)
-    bt.logging.add_args(parser)
-    bt.axon.add_args(parser)
-
-    # Add default arguments
-    add_args(parser)
-
-    config = bt.config(parser)
-    check_config(config)
+    if config is None:
+        parser = argparse.ArgumentParser()
+        bt.wallet.add_args(parser)
+        bt.subtensor.add_args(parser)
+        bt.logging.add_args(parser)
+        bt.axon.add_args(parser)
+        add_args(parser)
+        config = bt.config(parser)
+        check_config(config)
 
     return config
 
 
-def get_metagraph(netuid: int = 25, network: str = "test", **kwargs) -> bt.metagraph:
-    global metagraph
-    if not metagraph:
-        metagraph = bt.metagraph(
-            netuid=netuid,
-            network=network,
-            **kwargs,
+async def update_validator_settings() -> None:
+    """
+    Update the validator settings in the global configuration.
+
+    Args:
+        validator_settings (Dict): New validator settings to apply.
+
+    Returns:
+        bt.config: The updated global configuration object.
+    """
+    global config
+    validator_settings: Dict = await download_validator_settings()
+
+    if not validator_settings:
+        logger.error("Failed to update validator settings")
+        return config
+
+    config.alchemy.ma_decay = float(
+        validator_settings.get(
+            "ma_decay",
+            config.ma_decay,
         )
+    )
+    config.alchemy.request_frequency = int(
+        validator_settings.get(
+            "request_frequency",
+            config.request_frequency,
+        )
+    )
+    config.alchemy.query_timeout = float(
+        validator_settings.get(
+            "query_timeout",
+            config.query_timeout,
+        )
+    )
+    config.alchemy.async_timeout = float(
+        validator_settings.get(
+            "async_timeout",
+            config.async_timeout,
+        )
+    )
+    config.alchemy.epoch_length = int(
+        validator_settings.get(
+            "epoch_length",
+            config.epoch_length,
+        )
+    )
 
-    return metagraph
+    logger.info(
+        f"Retrieved the latest validator settings: {validator_settings}"
+    )
 
 
-def get_backend_client() -> "TensorAlchemyBackendClient":
-    global backend_client
-    if not backend_client:
-        from neurons.validator.backend.client import TensorAlchemyBackendClient
-
-        backend_client = TensorAlchemyBackendClient()
-
-    return backend_client
-
-
-def get_device(new_device: Optional[torch.device] = None) -> torch.device:
-    global device
-    if not device:
-        if new_device is None:
-            device = get_default_device()
-
-        else:
-            device = new_device
-
-    return device
+config: bt.config = None

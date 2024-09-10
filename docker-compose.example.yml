@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  stableminer:
+    build:
+      context: .
+      dockerfile: ./neurons/miners/Dockerfile
+    container_name: stableminer_container
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - .:/app
+      - ~/.bittensor:/root/.bittensor
+    ports:
+      - "8101:8101"
+    command: ["bash", "-c", "python3.10 /app/neurons/miners/StableMiner/main.py \
+        --wallet.name YOUR_WALLET_NAME \
+        --wallet.hotkey YOUR_WALLET_HOTKEY \
+        --netuid 25 \
+        --subtensor.network test \
+        --axon.port 8101 \
+        --logging.debug \
+        --logging.trace \
+        --miner.device cuda:0 \
+        --miner.model stabilityai/stable-diffusion-xl-base-1.0 \
+        --refiner.enable false"]
+    networks:
+      - stableminer_network
+
+  validator:
+    build:
+      context: .
+      dockerfile: ./neurons/validator/Dockerfile
+    container_name: validator_container
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - .:/app
+      - ~/.bittensor:/root/.bittensor
+    ports:
+      - "8000:8000"
+    command: ["bash", "-c", "python3.10 /app/neurons/validator/main.py \
+      --wallet.name YOUR_WALLET_NAME \
+      --wallet.hotkey YOUR_WALLET_HOTKEY \
+      --netuid 25 \
+      --subtensor.network test \
+      --axon.port 8000 \
+      --logging.debug \
+      --logging.trace"]
+    networks:
+      - stableminer_network
+
+networks:
+  stableminer_network:
+    driver: bridge

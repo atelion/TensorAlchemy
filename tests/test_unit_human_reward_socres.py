@@ -7,7 +7,10 @@ import bittensor as bt
 from loguru import logger
 
 # Import the actual get_metagraph function
-import neurons.validator.config as validator_config
+import neurons.config as validator_config
+from neurons.utils.image import image_tensor_to_base64
+
+from tests.fixtures import TEST_IMAGES
 
 
 def mock_metagraph():
@@ -46,27 +49,23 @@ mock_client = mock_backend_client()
 def patch_all_dependencies(func):
     @wraps(func)
     @patch(
-        "neurons.validator.config.get_metagraph",
+        "neurons.config.get_metagraph",
         return_value=mock_meta,
     )
     @patch(
-        "neurons.validator.config.get_backend_client",
+        "neurons.config.get_backend_client",
         return_value=mock_client,
     )
     @patch(
-        "neurons.validator.rewards.models.base.get_metagraph",
+        "scoring.models.base.get_metagraph",
         return_value=mock_meta,
     )
     @patch(
-        "neurons.validator.rewards.pipeline.get_metagraph",
+        "scoring.pipeline.get_metagraph",
         return_value=mock_meta,
     )
     @patch(
-        "neurons.validator.rewards.models.human.get_metagraph",
-        return_value=mock_meta,
-    )
-    @patch(
-        "neurons.validator.rewards.models.human.get_backend_client",
+        "scoring.models.rewards.human.get_backend_client",
         return_value=mock_client,
     )
     async def wrapper(*args, **kwargs):
@@ -77,20 +76,20 @@ def patch_all_dependencies(func):
 
 @pytest.mark.asyncio
 @patch_all_dependencies
-async def test_apply_human_voting_weight():
+async def test_apply_human_voting_weight(*args):
     # Import here to ensure patches are applied first
-    from neurons.validator.config import get_metagraph
-    from neurons.validator.rewards.pipeline import (
+    from neurons.config import get_metagraph, get_device
+    from scoring.pipeline import (
         apply_function,
-        apply_reward_functions,
+        apply_functions,
     )
-    from neurons.validator.rewards.models import (
-        RewardModelType,
-        PackedRewardModel,
-        EmptyScoreRewardModel,
+    from scoring.models.types import PackedRewardModel
+    from scoring.models.empty import EmptyScoreRewardModel
+    from scoring.models.types import RewardModelType
+    from scoring.models.rewards.human import (
         HumanValidationRewardModel,
     )
-    from neurons.validator.rewards.types import (
+    from scoring.types import (
         ScoringResults,
     )
 
@@ -131,7 +130,10 @@ async def test_apply_human_voting_weight():
     assert torch.all(empty_rewards.scores == 0)
 
     # Now, apply HumanValidationRewardModel
-    rewards: ScoringResults = await apply_reward_functions(
+    rewards: ScoringResults = await apply_functions(
+        torch.ones(
+            get_metagraph().n,
+        ).to(get_device()),
         [
             PackedRewardModel(
                 weight=1.0,
@@ -140,6 +142,7 @@ async def test_apply_human_voting_weight():
         ],
         generate_synapse(),
         responses,
+        combine=lambda results, rewards: results * rewards,
     )
 
     human_rewards: torch.Tensor = rewards.get_score(
@@ -180,12 +183,6 @@ def generate_synapse() -> bt.Synapse:
         seed=-1,
         model_type=ModelType.ALCHEMY.value,
         images=[
-            bt.Tensor.serialize(
-                torch.full(
-                    [3, 1024, 1024],
-                    254,
-                    dtype=torch.float,
-                )
-            )
+            image_tensor_to_base64(TEST_IMAGES["REAL_IMAGE_LOW_INFERENCE"])
         ],
     )

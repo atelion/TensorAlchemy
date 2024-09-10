@@ -43,13 +43,12 @@ source ~/venvs/TensorAlchemy/bin/activate && cd ~/TensorAlchemy && pip install -
 
 ### STEP 5. LAUNCH MINER
 ```bash
-python ~/TensorAlchemy/neurons/miners/StableMiner/main.py --wallet.name NAME --wallet.hotkey HOTKEY --netuid 26 --subtensor.network finney --axon.port 8101 --miner.device cuda:0 --logging.debug --wandb.entity ENTITY --wandb.project PROJECT --wandb.api_key APIKEY
+python ~/TensorAlchemy/neurons/miners/StableMiner/main.py --wallet.name NAME --wallet.hotkey HOTKEY --netuid 26 --subtensor.network finney --axon.port 8101 --miner.device cuda:0 --logging.debug
 ```
 
 
 ### NOTES
 
-- ⚗️ You can remove the wandb options from the start command if you don’t want to log your miner’s images directly to your own wandb account.
 - ⚗️ You can try adding the `--miner.optimize` flag to improve inference speed
 
 
@@ -100,7 +99,7 @@ source ~/venvs/TensorAlchemy/bin/activate && cd ~/TensorAlchemy && pip install -
 
 ### STEP 5. LAUNCH MINER
 ```bash
-pm2 start ~/TensorAlchemy/neurons/miners/StableMiner/main.py --interpreter ~/venvs/TensorAlchemy/bin/python --restart-delay 30000 --name NAME --  --wallet.name WALLET --wallet.hotkey HOTKEY --axon.port PORT --netuid 26 --subtensor.network finney --miner.device cuda:0 --logging.debug --wandb.entity ENTITY --wandb.project PROJECT --wandb.api_key APIKEY
+pm2 start ~/TensorAlchemy/neurons/miners/StableMiner/main.py --interpreter ~/venvs/TensorAlchemy/bin/python --restart-delay 30000 --name NAME --  --wallet.name WALLET --wallet.hotkey HOTKEY --axon.port PORT --netuid 26 --subtensor.network finney --miner.device cuda:0 --logging.debug
 ```
 
 
@@ -162,7 +161,7 @@ cd ~/TensorAlchemy && pip install -e .
 
 ### STEP 4. LAUNCH MINER
 ```bash
-pm2 start ~/TensorAlchemy/neurons/miners/StableMiner/main.py --interpreter ~/anaconda3/envs/py310/bin/python --restart-delay 30000 --name NAME --  --wallet.name WALLET --wallet.hotkey HOTKEY --axon.port PORT --netuid 26 --subtensor.network finney --miner.device cuda:0 --logging.debug --wandb.entity ENTITY --wandb.project PROJECT --wandb.api_key APIKEY
+pm2 start ~/TensorAlchemy/neurons/miners/StableMiner/main.py --interpreter ~/anaconda3/envs/py310/bin/python --restart-delay 30000 --name NAME --  --wallet.name WALLET --wallet.hotkey HOTKEY --axon.port PORT --netuid 26 --subtensor.network finney --miner.device cuda:0 --logging.debug
 ```
 
 ### NOTES

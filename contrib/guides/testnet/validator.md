@@ -50,10 +50,6 @@ Running without manual validator
 ```bash
 python ~/TensorAlchemy/neurons/validator/main.py --wallet.name NAME --wallet.hotkey HOTKEY --netuid 25 --subtensor.network test --axon.port 8000 --logging.debug --logging.trace
 ```
-If you encounter an error with wandb when launching the validator, please try running this command first: wandb login --anonymously
-
-
-Important note:  Your start command (step 6) is logged to a public wandb account so do not include the API key in the start command.
 
 ### Running with manual validator
 ```bash
