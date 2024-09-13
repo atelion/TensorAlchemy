@@ -22,6 +22,11 @@ import argparse
 from transformers import CLIPImageProcessor
 import pathlib, sys
 
+cuda_device_id = os.environ.get('CUDA_VISIBLE_DEVICES', 'Not')
+if cuda_device_id != 'Not':
+    cuda_device_id = int(cuda_device_id)
+
+
 
 redis_async_result = RedisAsyncResultBackend(
     redis_url="redis://localhost:6379",
@@ -37,20 +42,35 @@ prompts = [
 ]
 
 result = []
-
+## ProteusV0.4
 # Load VAE component
 vae = AutoencoderKL.from_pretrained(
     "madebyollin/sdxl-vae-fp16-fix", 
     torch_dtype=torch.float16
 )
 
-t2i_model = StableDiffusionXLPipeline.from_pretrained(
+proteus_pipe = StableDiffusionXLPipeline.from_pretrained(
     "dataautogpt3/ProteusV0.4-Lightning", 
     vae=vae,
     torch_dtype=torch.float16
 )
 
-t2i_model.scheduler = EulerAncestralDiscreteScheduler.from_config(t2i_model.scheduler.config)
+proteus_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(proteus_pipe.scheduler.config)
+
+## Playground
+playground_pipe = DiffusionPipeline.from_pretrained(
+        "playgroundai/playground-v2.5-1024px-aesthetic",
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+
+## juggernautxl
+juggernautxl_pipe = DiffusionPipeline.from_pretrained("RunDiffusion/Juggernaut-XL-v9", torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
+
+pipes = [proteus_pipe, playground_pipe, juggernautxl_pipe]
+pipe = pipes[cuda_device_id%3]
+print(f"CUDA_DEVICE_ID is {cuda_device_id}\n")
+
 negative_prompt = "nsfw, bad quality, bad anatomy, worst quality, low quality, low resolutions, extra fingers, blur, blurry, ugly, wrongs proportions, watermark, image artifacts, lowres, ugly, jpeg artifacts, deformed, noisy image"
 scoring_model = reward.load("ImageReward-v1.0")
 
@@ -67,7 +87,7 @@ def pil_image_to_base64(image: Image.Image, format="JPEG") -> str:
 @broker.task
 async def generate_image(prompt: str, guidance_scale: float, num_inference_steps: int):
     start_time = time.time()
-    t2i_model.to("cuda")
+    pipe.to("cuda")
     
     global result
     """Solve all problems in the world."""
@@ -75,7 +95,7 @@ async def generate_image(prompt: str, guidance_scale: float, num_inference_steps
     print(f"-------------prompt in broker: {prompt}-------------------")
     print(f"-------------Guidance_scale in broker: {guidance_scale}-------------------")
     
-    images = t2i_model(prompt=prompt, negative_prompt=negative_prompt, width=1024, height=1024, guidance_scale=7.5, num_inference_steps=35).images
+    images = pipe(prompt=prompt, negative_prompt=negative_prompt, width=1024, height=1024, guidance_scale=7.5, num_inference_steps=35).images
     
     
     end_time = time.time()

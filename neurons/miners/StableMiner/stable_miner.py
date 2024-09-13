@@ -19,6 +19,7 @@ from neurons.miners.StableMiner.utils import warm_up
 from neurons.utils.image import image_to_base64
 import torchvision.transforms as transforms
 from diffusers.callbacks import SDXLCFGCutoffCallback
+import bittensor as bt
 
 
 class StableMiner(BaseMiner):
